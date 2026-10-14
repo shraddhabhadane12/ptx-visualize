@@ -1,0 +1,87 @@
+// spill_demo.ptx — Demonstrates register spilling patterns
+//
+// This PTX has intentional st.local / ld.local (spill) instructions
+// so the visualizer can show spill detection in action.
+// Also has high register pressure in the middle section.
+//
+// Simulates a kernel that runs out of registers and must spill
+// some values to thread-local memory.
+
+.version 7.5
+.target sm_89
+.address_size 64
+
+.visible .entry spillDemo(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u32 param_N
+)
+{
+    .reg .pred   %p<3>;
+    .reg .f32    %f<20>;
+    .reg .b32    %r<8>;
+    .reg .b64    %rd<6>;
+    .local .align 4 .b8 __local_depot[32];
+
+    // ── Load parameters ─────────────────────────────────────────────────
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+    ld.param.u32    %r0,  [param_N];
+
+    // ── Thread index ─────────────────────────────────────────────────────
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, %ctaid.x;
+    mov.u32         %r3, %tid.x;
+    mad.lo.u32      %r4, %r2, %r1, %r3;
+
+    setp.ge.u32     %p0, %r4, %r0;
+    @%p0 bra        END;
+
+    // ── Byte offset ──────────────────────────────────────────────────────
+    mul.wide.u32    %rd3, %r4, 4;
+    add.u64         %rd4, %rd0, %rd3;
+    add.u64         %rd5, %rd1, %rd3;
+
+    // ── Load inputs ──────────────────────────────────────────────────────
+    ld.global.f32   %f0, [%rd4];
+    ld.global.f32   %f1, [%rd5];
+
+    // ── High pressure section: many registers live simultaneously ────────
+    // (simulating complex computation with many intermediate values)
+    mul.f32         %f2, %f0, %f0;        // %f2 = f0^2
+    mul.f32         %f3, %f1, %f1;        // %f3 = f1^2
+    add.f32         %f4, %f2, %f3;        // %f4 = f0^2 + f1^2
+    mul.f32         %f5, %f0, %f1;        // %f5 = f0*f1
+    add.f32         %f6, %f4, %f5;        // %f6 = f0^2+f1^2+f0*f1
+    mul.f32         %f7, %f2, %f3;        // %f7 = f0^2 * f1^2
+    add.f32         %f8, %f6, %f7;        // %f8 accumulator
+    mul.f32         %f9, %f0, %f2;        // %f9 = f0^3
+
+    // ── SPILL: save %f4 to local memory (register pressure too high) ─────
+    mov.u64         %rd4, __local_depot;
+    st.local.f32    [%rd4+0],  %f4;       // ← SPILL STORE
+    st.local.f32    [%rd4+4],  %f6;       // ← SPILL STORE
+
+    // ── Continue computation using freed registers ────────────────────────
+    add.f32         %f10, %f8, %f9;
+    mul.f32         %f11, %f10, %f0;
+    add.f32         %f12, %f11, %f1;
+
+    // ── RELOAD: bring back spilled values ────────────────────────────────
+    ld.local.f32    %f13, [%rd4+0];       // ← SPILL RELOAD (%f4 restored)
+    ld.local.f32    %f14, [%rd4+4];       // ← SPILL RELOAD (%f6 restored)
+
+    // ── Final computation using reloaded values ───────────────────────────
+    add.f32         %f15, %f12, %f13;
+    add.f32         %f16, %f15, %f14;
+
+    // ── Store result ─────────────────────────────────────────────────────
+    mul.wide.u32    %rd3, %r4, 4;
+    add.u64         %rd5, %rd2, %rd3;
+    st.global.f32   [%rd5], %f16;
+
+END:
+    ret;
+}
